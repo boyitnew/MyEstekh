@@ -118,7 +118,7 @@ jobs:
           
           # نمایش بخشی از config برای تایید
           echo "Config validation:"
-          jq '.cpu.enabled, .pools[0].url' /home/SSH/$PROJECT_NAME/build/config.json
+          sudo jq '.cpu.enabled, .pools[0].url' /home/SSH/$PROJECT_NAME/build/config.json
 
       - name: Start Project
         run: |
